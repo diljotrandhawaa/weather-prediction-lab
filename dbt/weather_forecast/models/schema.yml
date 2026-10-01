@@ -1,0 +1,44 @@
+version: 2
+
+sources:
+  - name: raw
+    database: DATA_226
+    schema: RAW
+    tables:
+      - name: weather_forecast
+        identifier: WEATHER_FORECAST
+        columns:
+          - name: CITY
+            data_tests:
+              - not_null
+          - name: FORECAST_DATE
+            data_tests:
+              - not_null
+
+models:
+  - name: stg_weather_forecast
+    description: "One current forecast per city and calendar day."
+    columns:
+      - name: city_date_key
+        data_tests:
+          - unique
+          - not_null
+      - name: city
+        data_tests:
+          - not_null
+      - name: forecast_date
+        data_tests:
+          - not_null
+  - name: fct_weather_metrics
+    description: "Seven-day rolling forecast metrics and predicted dry-spell length."
+    columns:
+      - name: city_date_key
+        data_tests:
+          - unique
+          - not_null
+      - name: rolling_7d_max_temp_c
+        data_tests:
+          - not_null
+      - name: forecast_date
+        data_tests:
+          - not_null

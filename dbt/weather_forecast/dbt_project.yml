@@ -1,0 +1,14 @@
+name: weather_forecast
+version: '1.0.0'
+config-version: 2
+profile: weather_forecast
+model-paths: ["models"]
+snapshot-paths: ["snapshots"]
+clean-targets: ["target", "dbt_packages"]
+
+models:
+  weather_forecast:
+    staging:
+      +materialized: view
+    marts:
+      +materialized: table
