@@ -28,11 +28,19 @@ def run_dbt(command):
         SNOWFLAKE_WAREHOUSE=extra.get("warehouse") or "COMPUTE_WH",
         SNOWFLAKE_ROLE=extra.get("role") or "ACCOUNTADMIN",
     )
-    subprocess.run(
+    result = subprocess.run(
         ["dbt", command, "--project-dir", DBT_ROOT, "--profiles-dir", DBT_ROOT],
         env=env,
-        check=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.STDOUT,
+        text=True,
+        check=False,
     )
+    # Airflow may not capture a child process's inherited stdout. Emit dbt's
+    # own error and scrub the credential if an upstream tool echoed it.
+    output = (result.stdout or "").replace(connection.password, "[redacted]")
+    print(output, flush=True)
+    result.check_returncode()
 
 
 @dag(
