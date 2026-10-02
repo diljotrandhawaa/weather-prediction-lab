@@ -1,114 +1,142 @@
-# DATA 226 — Weather Forecast Analytics
+# Weather Forecast Analytics
 
-Open-Meteo daily forecasts for San José and Bakersfield flow through Airflow,
-Snowflake, dbt, and Tableau. This lab builds on `hw_3.py`; it leaves the existing
-`DATA_226.RAW.WEATHER_DATA` historical/archive table and DAG untouched.
+DATA 226 lab using Open-Meteo, Airflow, Snowflake, dbt, and Tableau Public to
+compare 14-day forecasts for San Jose and Bakersfield. The project is separate
+from the older historical-weather `hw_3.py` DAG and `RAW.WEATHER_DATA` table.
+
+## Architecture
 
 ```mermaid
-flowchart LR
-  A["Open-Meteo forecast API"] --> B["Airflow forecast ETL"]
-  B --> C["Snowflake RAW.WEATHER_FORECAST"]
-  C --> D["Airflow dbt DAG"]
-  D --> E["Snowflake ANALYTICS metrics + snapshot"]
-  E --> F["Tableau dashboard"]
+flowchart TD
+  API["Open-Meteo forecast API"] --> ETL["Airflow: weather_forecast_two_cities"]
+  ETL --> RAW["Snowflake: RAW.WEATHER_FORECAST"]
+  RAW --> DBT["Airflow Dataset trigger: weather_forecast_dbt"]
+  DBT --> STG["dbt: ANALYTICS.STG_WEATHER_FORECAST"]
+  STG --> FACT["dbt: ANALYTICS.FCT_WEATHER_METRICS"]
+  STG --> SNAP["dbt: ANALYTICS.SNAP_WEATHER_FORECAST"]
+  FACT --> CSV["CSV export"]
+  CSV --> BI["Tableau Public dashboard"]
 ```
 
-## Fit with your Docker Compose
+The ETL runs daily at 08:00 America/Los_Angeles (`catchup=False`). Its
+successful load emits an Airflow Dataset event, starting the dbt DAG. The dbt
+tasks run `dbt run`, `dbt test`, and `dbt snapshot` in that order.
 
-Your existing Compose file already mounts host `dags/` at `/opt/airflow/dags`
-and host `dbt/` at `/opt/airflow/dbt`, and installs dbt-snowflake. **No Compose
-change is needed.** Copy the two Python files in this project's `dags/` into
-your existing host `dags/` folder. Copy the `dbt/weather_forecast/` directory
-into your existing host `dbt/` folder. Keep your existing dbt project and
-`hw_3.py` where they are. Both DAGs use your existing connection ID
-`snowflake_acc_data220`.
+## Repository layout
 
-## Configure and run
+| Path | Purpose |
+| --- | --- |
+| `dags/weather_forecast_etl.py` | Fetches and validates both cities; transactionally merges forecasts. |
+| `dags/weather_forecast_dbt.py` | Dataset-triggered dbt run, test, and snapshot tasks. |
+| `dbt/weather_forecast/dbt_project.yml` | Project settings and model materializations. |
+| `dbt/weather_forecast/profiles.yml` | Snowflake profile using environment variables, with no stored password. |
+| `dbt/weather_forecast/models/staging/stg_weather_forecast.sql` | Staging view and city-date key. |
+| `dbt/weather_forecast/models/marts/fct_weather_metrics.sql` | Forecast analytics table for Tableau. |
+| `dbt/weather_forecast/models/schema.yml` | Source and model data tests. |
+| `dbt/weather_forecast/tests/assert_nonnegative_precipitation.sql` | Singular data test. |
+| `dbt/weather_forecast/snapshots/snap_weather_forecast.sql` | Forecast revision history. |
+| `report/lab_report.md` | Report with evidence placeholders. |
 
-1. In Snowflake, confirm `DATA_226.RAW` and `DATA_226.ANALYTICS` exist and your
-   Airflow Snowflake role can create tables/views in them. The ETL creates its
-   own RAW table; dbt creates its models and snapshot in ANALYTICS. Your older
-   RAW.WEATHER_DATA table is not modified.
-2. In Airflow **Admin → Variables**, create `weather_cities` as this JSON:
+## Data products and metrics
+
+`DATA_226.RAW.WEATHER_FORECAST` stores the current forecast for each city
+and forecast date. `STG_WEATHER_FORECAST` is a dbt view with a derived
+`CITY_DATE_KEY`. `FCT_WEATHER_METRICS` is a dbt table containing:
+
+| Field | Meaning |
+| --- | --- |
+| `ROLLING_7D_MAX_TEMP_C` | Mean maximum temperature for the current and up to six preceding forecast dates. |
+| `ROLLING_7D_PRECIPITATION_MM` | Sum of forecast precipitation over the same window. |
+| `TEMP_ANOMALY_C` | Daily maximum minus its rolling mean, not a historical-climate anomaly. |
+| `DRY_SPELL_DAYS` | Consecutive days with forecast precipitation below 1 mm; resets on a wet day. |
+
+The first six rolling windows are partial. The dbt check-strategy snapshot
+records a new version when weather code, maximum or minimum temperature, or
+precipitation changes. It needs runs before and after a revision to retain
+both versions. These are analytics of API forecasts, not predictions from a
+separately trained model.
+
+## Idempotency and validation
+
+The ETL fetches and validates both cities before writing. It inserts the
+incoming rows into a temporary Snowflake table and runs a change-sensitive
+`MERGE` within `BEGIN`/`COMMIT`, with `ROLLBACK` on error. Matching uses
+`(CITY, FORECAST_DATE)`: identical reruns leave the row and
+`LAST_CHANGED_AT` unchanged; changed forecasts are updated. The ETL limits
+active runs to one and produces one source row per city and date. A primary
+key is declared on the Snowflake standard table but is not enforced there.
+
+dbt checks keys for uniqueness and non-null values, validates other required
+columns, and rejects negative precipitation. The Tableau Public dashboard
+uses a CSV export of `FCT_WEATHER_METRICS`; refreshing it requires a new
+export after the pipeline runs.
+
+## Reproducing the pipeline
+
+The Docker Compose setup mounts host `dags/` at `/opt/airflow/dags` and host
+`dbt/` at `/opt/airflow/dbt`; it includes Airflow 2.10.1, the Snowflake
+provider, and dbt-snowflake. Place the two DAG files and the entire
+`dbt/weather_forecast/` directory in those mounts.
+
+1. Configure Airflow connection `snowflake_acc_data220` with Snowflake
+   account, user, password, `DATA_226` database, warehouse, and a role with
+   RAW read/write and ANALYTICS object-creation privileges. Keep secrets out
+   of Git.
+2. Create Airflow Variable `weather_cities` as JSON:
 
    ```json
    [
-     {"name":"San Jose","latitude":37.3382,"longitude":-121.8863},
-     {"name":"Bakersfield","latitude":35.3733,"longitude":-119.0187}
+     {"name": "San Jose", "latitude": 37.3382, "longitude": -121.8863},
+     {"name": "Bakersfield", "latitude": 35.3733, "longitude": -119.0187}
    ]
    ```
 
-   This new DAG calls `https://api.open-meteo.com/v1/forecast` directly; the old
-   `weather_api_url` and `api_params` variables remain available to `hw_3.py`.
-3. From your existing Airflow Compose directory run `docker compose up -d`.
-   Open Airflow at http://localhost:8081. Unpause
-   `weather_forecast_two_cities` and `weather_forecast_dbt`; trigger the ETL
-   once. The dbt DAG starts from the dataset event **after a successful load**.
-   The ETL normally runs daily at 08:00 Los Angeles time; the dbt DAG has no
-   separate clock schedule.
-4. Inspect both DAGs in the Airflow Grid/Graph UI. In Snowflake, verify:
+3. Start the existing Docker Compose stack, unpause both weather DAGs, and
+   trigger `weather_forecast_two_cities`. After `load_forecast` succeeds,
+   verify a `dataset_triggered__` run of `weather_forecast_dbt` with all
+   three tasks green. Task logs show the dbt command output.
+4. Export `DATA_226.ANALYTICS.FCT_WEATHER_METRICS` as CSV. The Tableau
+   dashboard displays daily maximum temperature, seven-day moving average,
+   seven-day rainfall, and predicted dry-spell length by city, with a
+   forecast-date filter.
 
-   ```sql
-   SELECT city, COUNT(*) AS forecast_days, MIN(forecast_date) AS first_day,
-          MAX(forecast_date) AS last_day
-   FROM DATA_226.RAW.WEATHER_FORECAST GROUP BY city ORDER BY city;
+## Verification queries
 
-   SELECT city, forecast_date, temperature_max_c, rolling_7d_max_temp_c,
-          temp_anomaly_c, rolling_7d_precipitation_mm, dry_spell_days
-   FROM DATA_226.ANALYTICS.FCT_WEATHER_METRICS
-   ORDER BY city, forecast_date;
+```sql
+SELECT CITY, COUNT(*) AS FORECAST_DAYS,
+       MIN(FORECAST_DATE) AS FIRST_DAY, MAX(FORECAST_DATE) AS LAST_DAY
+FROM DATA_226.RAW.WEATHER_FORECAST
+GROUP BY CITY ORDER BY CITY;
 
-   SELECT city, forecast_date, dbt_valid_from, dbt_valid_to
-   FROM DATA_226.ANALYTICS.SNAP_WEATHER_FORECAST
-   ORDER BY city, forecast_date, dbt_valid_from;
-   ```
+SELECT CITY, FORECAST_DATE, TEMPERATURE_MAX_C,
+       ROLLING_7D_MAX_TEMP_C, TEMP_ANOMALY_C,
+       ROLLING_7D_PRECIPITATION_MM, DRY_SPELL_DAYS
+FROM DATA_226.ANALYTICS.FCT_WEATHER_METRICS
+ORDER BY CITY, FORECAST_DATE;
 
-5. For explicit dbt command screenshots, run inside the Airflow service:
+SELECT CITY, FORECAST_DATE, DBT_VALID_FROM, DBT_VALID_TO
+FROM DATA_226.ANALYTICS.SNAP_WEATHER_FORECAST
+ORDER BY CITY, FORECAST_DATE, DBT_VALID_FROM;
+```
 
-   ```bash
-   docker compose exec airflow bash
-   cd /opt/airflow/dbt/weather_forecast
-   ```
+On the observed October 1, 2026 run, the RAW table held 14 forecast dates
+per city (28 rows), October 1–14. Forecast precipitation was 0 mm for both
+cities across that period; the dashboard's rainfall lines overlap at zero.
+These forecast values may change on later runs.
 
-   dbt needs `SNOWFLAKE_ACCOUNT`, `SNOWFLAKE_USER`, `SNOWFLAKE_PASSWORD`,
-   `SNOWFLAKE_DATABASE`, `SNOWFLAKE_WAREHOUSE`, and `SNOWFLAKE_ROLE` in that
-   interactive shell. The dbt DAG derives them from the existing Airflow
-   Snowflake connection automatically. You can use the dbt DAG task logs as
-   screenshots without entering credentials into a shell.
+## Report and evidence
 
-## Idempotency and forecast semantics
+`report/lab_report.md` covers the problem, requirements, architecture,
+table structures, implementation, dashboard, future work, and references.
+The completed submission report should contain Airflow DAG, connection, and
+variable screenshots (with credentials hidden), dbt run/test/snapshot output,
+Snowflake results, and at least two Tableau dashboard screenshots showing
+different date selections. Save evidence in `report/screenshots/` with
+descriptive names.
 
-The loader fetches both cities before modifying Snowflake. It inserts all
-responses into a session-local temporary table and `MERGE`s in one transaction.
-The key is `(CITY, FORECAST_DATE)`. Repeating an identical forecast neither
-duplicates rows nor updates `LAST_CHANGED_AT`. When a forecast changes, its
-current value is updated and a later dbt snapshot run retains its prior value.
-Snapshot changes are visible only if snapshots run both before and after a
-forecast revision. Standard Snowflake primary keys are metadata rather than
-an enforcement mechanism; serial Airflow runs and unique source rows matter.
+## References
 
-Forecast metrics describe **predicted weather**, not observed weather.
-`rolling_7d_max_temp_c` and `rolling_7d_precipitation_mm` use the current day
-and at most six prior forecast dates, so the first six dates use partial
-windows. `temp_anomaly_c` is daily maximum minus that rolling maximum average,
-not an anomaly relative to historical climate. `dry_spell_days` counts
-consecutive forecast days with precipitation below 1 mm, resetting at 1 mm.
-
-## Tableau dashboard
-
-Connect Tableau to Snowflake `DATA_226.ANALYTICS.FCT_WEATHER_METRICS` using a
-Snowflake account with read access. Build a two-city daily maximum temperature
-line chart (add the rolling average), a precipitation chart (daily and rolling
-seven-day sum), and a dry-spell chart. Put `City` and `Forecast Date` on visible
-filters. Capture separate screenshots of each chart plus at least two dashboard
-screenshots with different forecast-date selections. The submitted report
-template is in `report/lab_report.md`.
-
-## Evidence and submission
-
-Capture the Airflow ETL and dbt DAG graphs and logs, Airflow connection and
-variable configuration **with credentials hidden**, dbt run/test/snapshot
-success, Snowflake schema/table views, Tableau dashboard states, and GitHub
-repository URL. Save screenshots under `report/screenshots/` before exporting
-the report to PDF. Do not claim the dashboard or runs are complete until those
-screenshots exist. Repo files: `dags/`, `dbt/`, `report/`, and this README.
+- [Open-Meteo Forecast API](https://open-meteo.com/en/docs)
+- [Apache Airflow documentation](https://airflow.apache.org/docs/apache-airflow/2.10.1/)
+- [dbt snapshots](https://docs.getdbt.com/docs/build/snapshots)
+- [Snowflake MERGE](https://docs.snowflake.com/en/sql-reference/sql/merge)
